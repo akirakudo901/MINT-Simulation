@@ -57,9 +57,9 @@ DETECTOR_KWARGS = dict(
     families=TAG_FAMILY,
     nthreads=1,
     quad_decimate=1.0,   # 2 = run quad detection on 1/2 resolution (faster, slightly less accurate)
-    quad_sigma=0.5,
+    quad_sigma=0,
     refine_edges=0, # outside of 0, improves detection (?) but reduces accuracy
-    decode_sharpening=0, #extend of sharpening of image, set to 0 might help with computation?
+    decode_sharpening=0.25, #extend of sharpening of image, set to 0 might help with computation?
     debug=0,
 )
 
@@ -316,11 +316,173 @@ def list_ports():
     return available_ports,working_ports,non_working_ports
 
 
+def _write_pose_csv(out_path: Path, csv_rows: list[dict]) -> None:
+    """Write pose rows to CSV using the standard field layout."""
+    if not csv_rows:
+        return
+    fieldnames = [
+        "frame",
+        "tag_id",
+        "tracked",
+        "x",
+        "y",
+        "z",
+        "yaw_deg",
+        "pitch_deg",
+        "roll_deg",
+        "center_x",
+        "center_y",
+        "c0_x",
+        "c0_y",
+        "c1_x",
+        "c1_y",
+        "c2_x",
+        "c2_y",
+        "c3_x",
+        "c3_y",
+    ]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+
+def _process_frame_and_collect(
+    frame_idx: int,
+    frame: np.ndarray,
+    detector: Detector,
+    *,
+    use_pose: bool,
+    camera_intrinsics: Optional[tuple[float, float, float, float]] = None,
+    tag_size_m: Optional[float] = None,
+    use_fallback_tracking: bool = False,
+    prev_gray: Optional[np.ndarray] = None,
+    prev_frame_dets: Optional[FrameDetections] = None,
+    csv_rows: Optional[list[dict]] = None,
+) -> tuple[list, Optional[np.ndarray], Optional[FrameDetections]]:
+    """
+    Detect tags in a frame, optionally perform fallback tracking, and append pose rows.
+
+    Returns:
+        detections, new_prev_gray, new_prev_frame_dets
+    """
+    gray = frame_to_grayscale(frame)
+
+    if use_pose:
+        detections = detect_apriltags_with_pose(
+            detector, frame, camera_intrinsics, tag_size_m  # type: ignore[arg-type]
+        )
+        raw_next_fd = detections_to_frame_detections(
+            detections,
+            frame_idx=frame_idx,
+            compute_homography=False,
+            tag_size=float(tag_size_m) if tag_size_m is not None else 1.0,
+        )
+        if (
+            use_fallback_tracking
+            and prev_gray is not None
+            and prev_frame_dets is not None
+        ):
+            frame_dets = track_pose_detections_with_fallback(
+                prev_gray,
+                prev_frame_dets,
+                gray,
+                raw_next_fd,
+                frame_idx=frame_idx,
+                tag_size=float(tag_size_m) if tag_size_m is not None else 1.0,
+            )
+            existing_ids = {int(d.tag_id) for d in detections}
+            for tag_id, ts in frame_dets.tags.items():
+                if tag_id in existing_ids:
+                    continue
+                # Synthetic detection without pose for tracked-only tags.
+                detections.append(
+                    type(
+                        "Det",
+                        (),
+                        {
+                            "tag_id": ts.tag_id,
+                            "center": ts.center,
+                            "corners": ts.corners,
+                        },
+                    )()
+                )
+            prev_frame_dets = frame_dets
+        else:
+            prev_frame_dets = raw_next_fd
+    else:
+        detections = detector.detect(gray)
+        prev_frame_dets = None
+
+    prev_gray = gray
+
+    if use_pose and csv_rows is not None and prev_frame_dets is not None:
+        for tag_id, ts in prev_frame_dets.tags.items():
+            x, y = ts.center
+            c = ts.corners  # 4x2 in pixel coords
+            tracked_flag = 1 if ts.source == "tracked" else 0
+
+            pose_R, pose_t = ts.pose_R, ts.pose_t
+            x_cam = y_cam = z_cam = None
+            yaw_deg = pitch_deg = roll_deg = None
+
+            if pose_R is not None and pose_t is not None:
+                # Direct pose from detector.
+                t = np.asarray(pose_t, dtype=np.float64).reshape(-1)
+                x_cam, y_cam, z_cam = float(t[0]), float(t[1]), float(t[2])
+                yaw_deg, pitch_deg, roll_deg = rotation_matrix_to_euler_deg(
+                    np.asarray(pose_R, dtype=np.float64).reshape(3, 3)
+                )
+            elif tracked_flag == 1 and ts.H_cam_to_tag is not None and camera_intrinsics is not None:
+                # Tracked-only: no x,y,z; recover orientation from homography.
+                R_from_H = homography_to_rotation(ts.H_cam_to_tag, camera_intrinsics)
+                yaw_deg, pitch_deg, roll_deg = rotation_matrix_to_euler_deg(R_from_H)
+
+            csv_rows.append({
+                    "frame": frame_idx,
+                    "tag_id": int(tag_id),
+                    "tracked": tracked_flag,  # 0=detected, 1=tracked
+                    "x": x_cam,
+                    "y": y_cam,
+                    "z": z_cam,
+                    "yaw_deg": yaw_deg,
+                    "pitch_deg": pitch_deg,
+                    "roll_deg": roll_deg,
+                    "center_x": float(x),
+                    "center_y": float(y),
+                    "c0_x": float(c[0][0]),
+                    "c0_y": float(c[0][1]),
+                    "c1_x": float(c[1][0]),
+                    "c1_y": float(c[1][1]),
+                    "c2_x": float(c[2][0]),
+                    "c2_y": float(c[2][1]),
+                    "c3_x": float(c[3][0]),
+                    "c3_y": float(c[3][1]),
+                })
+
+            if PRINT and yaw_deg is not None:
+                print(
+                    f"Frame {frame_idx}: tag_id={tag_id} tracked={tracked_flag} center=({x:.1f}, {y:.1f}) "
+                    f"pose x={x_cam:.4f} y={y_cam:.4f} z={z_cam:.4f} "
+                    f"yaw={yaw_deg:.2f}° pitch={pitch_deg:.2f}° roll={roll_deg:.2f}°"
+                )
+
+    if not use_pose and PRINT:
+        for d in detections:
+            x, y = d.center
+            print(
+                f"Frame {frame_idx}: tag_id={d.tag_id} center=({x:.1f}, {y:.1f}) corners={d.corners.tolist()}"
+            )
+
+    return detections, prev_gray, prev_frame_dets
+
+
 def run_on_source(
     source: str | Path | int,
     *,
     show: bool = True,
     max_frames: int | None = None,
+    segments: Optional[list[tuple[int, int]]] = None,
     width: int | None = None,
     height: int | None = None,
     camera_intrinsics: Optional[tuple[float, float, float, float]] = None,
@@ -333,6 +495,10 @@ def run_on_source(
 
     source: Path to a video file  (str or Path), or camera device index (int).
     max_frames: Number of frames before ending the process, defaults to None for videos and 100 for camera.
+    segments: Optional list of (start, end) frame indices to analyze for video files only.
+        Each tuple is interpreted as [start, end) in 0-based frame indices. When provided
+        for a video source, segments take precedence over max_frames and one CSV is
+        written per segment if output_csv is set.
     camera_intrinsics: Optional (fx, fy, cx, cy) for pose estimation. When set with tag_size_m, enables pose.
     tag_size_m: Physical AprilTag size in meters. When set with camera_intrinsics, enables pose estimation.
     output_csv: If set and pose estimation is enabled, writes position & angle per tag per frame to this CSV file.
@@ -349,6 +515,9 @@ def run_on_source(
 
     is_camera = isinstance(source, int)
     if is_camera:
+        if segments is not None:
+            print("Error: segments are only supported for video files, not cameras.", file=sys.stderr)
+            sys.exit(1)
         cap = cv2.VideoCapture(source)
         if not cap.isOpened():
             print(f"Error: could not open camera {source}", file=sys.stderr)
@@ -380,205 +549,223 @@ def run_on_source(
         if total_in_video <= 0:
             # Some codecs don't report frame count; use max_frames or a large number for tqdm
             total_in_video = max_frames if max_frames is not None else 0
-        if max_frames is not None:
-            total_for_tqdm = min(total_in_video, max_frames)
+        if segments is not None:
+            # Validate and normalize segments for video sources.
+            cleaned_segments: list[tuple[int, int]] = []
+            for start, end in segments:
+                if start < 0 or end <= start:
+                    print(f"Error: invalid segment ({start}, {end}); start must be >= 0 and end > start.",
+                           file=sys.stderr,)
+                    sys.exit(1)
+                if start >= total_in_video:
+                    print(f"Warning: segment ({start}, {end}) starts beyond video length ({total_in_video}); skipping.",
+                         file=sys.stderr,)
+                    continue
+                if end > total_in_video:
+                    print(f"Warning: segment ({start}, {end}) extends beyond video length ({total_in_video}); clamping end to {total_in_video}.",
+                          file=sys.stderr,)
+                    end = total_in_video
+                cleaned_segments.append((start, end))
+            if not cleaned_segments:
+                print("Error: no valid segments to process after validation.", file=sys.stderr)
+                sys.exit(1)
+            cleaned_segments.sort(key=lambda s: s[0])
+            segments = cleaned_segments
+            if max_frames is not None:
+                print("Warning: segments specified for video; ignoring max_frames.",
+                    file=sys.stderr,)
+                max_frames = None
+            total_for_tqdm = sum(end - start for start, end in segments)
         else:
-            total_for_tqdm = total_in_video
+            if max_frames is not None:
+                total_for_tqdm = min(total_in_video, max_frames)
+            else:
+                total_for_tqdm = total_in_video
 
     detector = get_detector()
-    frame_idx = 0
     window_name = "AprilTags (camera)" if is_camera else "AprilTags"
-    csv_rows: list[dict] = []  # for output_csv when use_pose
+    # Shared state for processing
     prev_gray: Optional[np.ndarray] = None
     prev_frame_dets: Optional[FrameDetections] = None
-    
-    # Use a single while True loop, always. Use tqdm as progress bar when total_for_tqdm exists (i.e. for video), else fallback to no tqdm.
-    pbar = None
-    if not is_camera:
-        # For video, show tqdm progress bar
-        pbar = tqdm(total=total_for_tqdm, unit="frame", desc="Detecting AprilTags")
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if max_frames is not None and frame_idx >= max_frames:
-            break
+    stop_requested = False
 
-        gray = frame_to_grayscale(frame)
-        if use_pose:
-            detections = detect_apriltags_with_pose(
-                detector, frame, camera_intrinsics, tag_size_m
-            )
-            raw_next_fd = detections_to_frame_detections(
-                detections,
-                frame_idx=frame_idx,
-                compute_homography=False,
-                tag_size=float(tag_size_m) if tag_size_m is not None else 1.0,
-            )
-            if use_fallback_tracking and prev_gray is not None and prev_frame_dets is not None:
-                frame_dets = track_pose_detections_with_fallback(
-                    prev_gray,
-                    prev_frame_dets,
-                    gray,
-                    raw_next_fd,
-                    frame_idx=frame_idx,
-                    tag_size=float(tag_size_m) if tag_size_m is not None else 1.0,
-                )
-                existing_ids = {int(d.tag_id) for d in detections}
-                for tag_id, ts in frame_dets.tags.items():
-                    if tag_id in existing_ids:
-                        continue
-                    # Synthetic detection without pose for tracked-only tags.
-                    detections.append(
-                        type(
-                            "Det",
-                            (),
-                            {
-                                "tag_id": ts.tag_id,
-                                "center": ts.center,
-                                "corners": ts.corners,
-                            },
-                        )()
-                    )
-                prev_frame_dets = frame_dets
-            else:
-                prev_frame_dets = raw_next_fd
+    # Non-segmented path (camera or whole video)
+    def _process_frames(
+        cap,
+        detector,
+        use_pose,
+        camera_intrinsics,
+        tag_size_m,
+        use_fallback_tracking,
+        show,
+        window_name,
+        output_csv,
+        csv_rows,
+        segment_range=None,
+        max_frames=None,
+        pbar=None,
+        stop_requested=False,
+    ):
+        """
+        Unified frame processing loop for both simple and segmented video.
+        - segment_range: (start, end) tuple for range of frames to process; or None for unsegmented.
+        - max_frames: max number of frames to process (applied only for unsegmented).
+        - csv_rows: list to which results are appended.
+        """
+        prev_gray = None
+        prev_frame_dets = None
+
+        if segment_range is not None:
+            start, end = segment_range
+            frame_idx = start
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            def should_continue(i): return i < end
         else:
-            # No pose estimation: keep original behavior (no fallback tracking).
-            detections = detector.detect(gray)
-            prev_frame_dets = None
-        prev_gray = gray
+            frame_idx = 0
+            def should_continue(i): return True if (max_frames is None) else i < max_frames
 
-        if use_pose and output_csv and prev_frame_dets is not None:
-            # Save one row per (frame, tag_id) from the merged detections (detected + tracked fallback).
-            for tag_id, ts in prev_frame_dets.tags.items():
-                x, y = ts.center
-                c = ts.corners  # 4x2 in pixel coords
-                tracked_flag = 1 if ts.source == "tracked" else 0
-
-                pose_R, pose_t = ts.pose_R, ts.pose_t
-                x_cam = y_cam = z_cam = None
-                yaw_deg = pitch_deg = roll_deg = None
-
-                if pose_R is not None and pose_t is not None:
-                    # Direct pose from detector.
-                    t = np.asarray(pose_t, dtype=np.float64).reshape(-1)
-                    x_cam, y_cam, z_cam = float(t[0]), float(t[1]), float(t[2])
-                    yaw_deg, pitch_deg, roll_deg = rotation_matrix_to_euler_deg(
-                        np.asarray(pose_R, dtype=np.float64).reshape(3, 3)
-                    )
-                elif tracked_flag == 1 and ts.H_cam_to_tag is not None and camera_intrinsics is not None:
-                    # Tracked-only: no x,y,z; recover orientation from homography.
-                    R_from_H = homography_to_rotation(ts.H_cam_to_tag, camera_intrinsics)
-                    yaw_deg, pitch_deg, roll_deg = rotation_matrix_to_euler_deg(R_from_H)
-
-                csv_rows.append({
-                    "frame": frame_idx,
-                    "tag_id": int(tag_id),
-                    "tracked": tracked_flag,  # 0=detected, 1=tracked
-                    "x": x_cam,
-                    "y": y_cam,
-                    "z": z_cam,
-                    "yaw_deg": yaw_deg,
-                    "pitch_deg": pitch_deg,
-                    "roll_deg": roll_deg,
-                    "center_x": float(x),
-                    "center_y": float(y),
-                    "c0_x": float(c[0][0]),
-                    "c0_y": float(c[0][1]),
-                    "c1_x": float(c[1][0]),
-                    "c1_y": float(c[1][1]),
-                    "c2_x": float(c[2][0]),
-                    "c2_y": float(c[2][1]),
-                    "c3_x": float(c[3][0]),
-                    "c3_y": float(c[3][1]),
-                })
-
-                if PRINT and yaw_deg is not None:
-                    print(
-                        f"Frame {frame_idx}: tag_id={tag_id} tracked={tracked_flag} center=({x:.1f}, {y:.1f}) "
-                        f"pose x={x_cam:.4f} y={y_cam:.4f} z={z_cam:.4f} "
-                        f"yaw={yaw_deg:.2f}° pitch={pitch_deg:.2f}° roll={roll_deg:.2f}°"
-                    )
-        else:
-            for d in detections:
-                x, y = d.center
-                if PRINT:
-                    print(f"Frame {frame_idx}: tag_id={d.tag_id} center=({x:.1f}, {y:.1f}) corners={d.corners.tolist()}")
-
-        if show:
-            for d in detections:
-                pts = d.corners.astype(np.int32)
-                cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
-                cx, cy = int(d.center[0]), int(d.center[1])
-                cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
-                if use_pose and hasattr(d, "pose_t") and d.pose_t is not None:
-                    # Draw three axis arrows (red=X, green=Y, blue=Z) from tag center
-                    fx, fy, cx_f, cy_f = camera_intrinsics
-                    t = d.pose_t.flatten()
-                    R = d.pose_R
-                    axis_length = 0.05  # meters in 3D
-                    # BGR: red, green, blue
-                    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
-                    for i in range(3):
-                        tip_cam = t + axis_length * R[:, i]
-                        pt = project_camera_to_image(
-                            float(tip_cam[0]), float(tip_cam[1]), float(tip_cam[2]),
-                            fx, fy, cx_f, cy_f,
-                        )
-                        if pt is not None:
-                            tip_pt = (int(round(pt[0])), int(round(pt[1])))
-                            cv2.arrowedLine(frame, (cx, cy), tip_pt, colors[i], 2, tipLength=0.2)
-                    label = str(d.tag_id)
-                else:
-                    label = str(d.tag_id)
-                cv2.putText(
-                    frame, label, (cx + 5, cy - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-                )
-            cv2.imshow(window_name, frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+        while should_continue(frame_idx):
+            ret, frame = cap.read()
+            if not ret:
                 break
 
-        frame_idx += 1
+            dets, prev_gray, prev_frame_dets = _process_frame_and_collect(
+                frame_idx,
+                frame,
+                detector,
+                use_pose=use_pose,
+                camera_intrinsics=camera_intrinsics,
+                tag_size_m=tag_size_m,
+                use_fallback_tracking=use_fallback_tracking,
+                prev_gray=prev_gray,
+                prev_frame_dets=prev_frame_dets,
+                csv_rows=csv_rows if (use_pose and output_csv) else None,
+            )
+
+            if show:
+                for d in dets:
+                    pts = d.corners.astype(np.int32)
+                    cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
+                    cx, cy = int(d.center[0]), int(d.center[1])
+                    cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+                    if use_pose and hasattr(d, "pose_t") and d.pose_t is not None:
+                        fx, fy, cx_f, cy_f = camera_intrinsics
+                        t = d.pose_t.flatten()
+                        R = d.pose_R
+                        axis_length = 0.05
+                        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+                        for i in range(3):
+                            tip_cam = t + axis_length * R[:, i]
+                            pt = project_camera_to_image(
+                                float(tip_cam[0]), float(tip_cam[1]), float(tip_cam[2]),
+                                fx, fy, cx_f, cy_f,
+                            )
+                            if pt is not None:
+                                tip_pt = (int(round(pt[0])), int(round(pt[1])))
+                                cv2.arrowedLine(
+                                    frame,
+                                    (cx, cy),
+                                    tip_pt,
+                                    colors[i],
+                                    2,
+                                    tipLength=0.2,
+                                )
+                        label = str(d.tag_id)
+                    else:
+                        label = str(d.tag_id)
+                    cv2.putText(
+                        frame,
+                        label,
+                        (cx + 5, cy - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 0),
+                        1,
+                    )
+                cv2.imshow(window_name, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    stop_requested = True
+                    break
+
+            frame_idx += 1
+            if pbar is not None:
+                pbar.update(1)
+
+        return stop_requested, frame_idx
+
+    if segments is None:
+        csv_rows: list[dict] = []  # for output_csv when use_pose
+        pbar = None
+        if not is_camera:
+            pbar = tqdm(total=total_for_tqdm, unit="frame", desc="Detecting AprilTags")
+        stop_requested, _ = _process_frames(
+            cap,
+            detector,
+            use_pose,
+            camera_intrinsics,
+            tag_size_m,
+            use_fallback_tracking,
+            show,
+            window_name,
+            output_csv,
+            csv_rows,
+            segment_range=None,
+            max_frames=max_frames,
+            pbar=pbar,
+        )
         if pbar is not None:
-            pbar.update(1)
-    
+            pbar.close()
+
+        cap.release()
+        if show:
+            cv2.destroyAllWindows()
+
+        if output_csv and csv_rows:
+            out_path = Path(output_csv)
+            _write_pose_csv(out_path, csv_rows)
+            print(f"Pose data written to {out_path} ({len(csv_rows)} rows).")
+        return
+
+    # Segmented video path
+    if output_csv is None:
+        print("Error: segments requires output_csv to be set to write per-segment CSVs.", file=sys.stderr)
+        sys.exit(1)
+
+    pbar = tqdm(total=total_for_tqdm, unit="frame", desc="Detecting AprilTags") if total_for_tqdm else None
+
+    for start, end in segments:
+        csv_rows_segment: list[dict] = []
+        stop_requested, last_frame_idx = _process_frames(
+            cap,
+            detector,
+            use_pose,
+            camera_intrinsics,
+            tag_size_m,
+            use_fallback_tracking,
+            show,
+            window_name,
+            output_csv,
+            csv_rows_segment,
+            segment_range=(start, end),
+            max_frames=None,
+            pbar=pbar,
+        )
+        # Write CSV for this segment
+        if csv_rows_segment:
+            base_path = Path(output_csv)
+            segment_out = base_path.with_name(f"{base_path.stem}_{start}-{end}{base_path.suffix}")
+            _write_pose_csv(segment_out, csv_rows_segment)
+            print(f"Pose data written to {segment_out} ({len(csv_rows_segment)} rows).")
+
+        if stop_requested:
+            break
+
     if pbar is not None:
         pbar.close()
 
     cap.release()
     if show:
         cv2.destroyAllWindows()
-
-    if output_csv and csv_rows:
-        out_path = Path(output_csv)
-        fieldnames = [
-            "frame",
-            "tag_id",
-            "tracked",
-            "x",
-            "y",
-            "z",
-            "yaw_deg",
-            "pitch_deg",
-            "roll_deg",
-            "center_x",
-            "center_y",
-            "c0_x",
-            "c0_y",
-            "c1_x",
-            "c1_y",
-            "c2_x",
-            "c2_y",
-            "c3_x",
-            "c3_y",
-        ]
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(csv_rows)
-        print(f"Pose data written to {out_path} ({len(csv_rows)} rows).")
 
 
 def analyze_video_apriltags(
@@ -812,6 +999,17 @@ def main():
         action="store_true",
         help="When pose estimation is OFF, recover missing tags using per-tag optical-flow tracking between frames.",
     )
+    parser.add_argument(
+        "--segments",
+        type=str,
+        default=None,
+        metavar="LIST",
+        help=(
+            "Optional list of frame segments for video files only, in the form "
+            "'start1:end1,start2:end2'. Each segment is [start, end) in 0-based frame indices. "
+            "When provided, segments take precedence over --max-frames and one CSV is written per segment."
+        ),
+    )
     args = parser.parse_args()
 
     # Apply optional detector overrides before creating any Detector instances.
@@ -854,6 +1052,30 @@ def main():
             sys.exit(1)
         return
 
+    segments: Optional[list[tuple[int, int]]] = None
+    if args.segments:
+        try:
+            segments_list: list[tuple[int, int]] = []
+            for part in args.segments.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                start_str, end_str = part.split(":")
+                start = int(start_str)
+                end = int(end_str)
+                if start < 0 or end <= start:
+                    raise ValueError
+                segments_list.append((start, end))
+            if not segments_list:
+                raise ValueError
+            segments = segments_list
+        except ValueError:
+            print(
+                "Error: --segments must be of the form 'start1:end1,start2:end2' with start >= 0 and end > start.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     if args.camera is not None:
         run_on_source(
             args.camera,
@@ -865,6 +1087,7 @@ def main():
             tag_size_m=args.tag_size,
             output_csv=args.output_csv,
             use_fallback_tracking=args.fallback_tracking,
+            segments=segments,
         )
     else:
         run_on_source(
@@ -875,6 +1098,7 @@ def main():
             tag_size_m=args.tag_size,
             output_csv=args.output_csv,
             use_fallback_tracking=args.fallback_tracking,
+            segments=segments,
         )
 
 
