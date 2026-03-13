@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Deque, Dict, Iterable, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -33,6 +34,122 @@ class TagState:
 class FrameDetections:
     frame_idx: int
     tags: Dict[int, TagState]
+
+
+def _yaw_rad_from_rotation_matrix(R: np.ndarray) -> float:
+    """Extract yaw (rotation around Z) from 3x3 rotation matrix. Returns radians."""
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    if sy > 1e-9:
+        return float(np.arctan2(R[1, 0], R[0, 0]))
+    return float(np.arctan2(-R[1, 2], R[1, 1]))
+
+
+def _yaw_rad_from_tag_state(tag: TagState) -> float:
+    """Yaw in radians: from pose_R if available, else image-plane angle of first edge."""
+    if tag.pose_R is not None:
+        return _yaw_rad_from_rotation_matrix(tag.pose_R)
+    corners = np.asarray(tag.corners, dtype=np.float64).reshape(4, 2)
+    return float(np.arctan2(corners[1, 1] - corners[0, 1], corners[1, 0] - corners[0, 0]))
+
+
+class MotionHistory:
+    """
+    Per-tag motion history used to extrapolate an initial flow guess for LK tracking.
+    Stores the last maxlen (frame_idx, center_xy, yaw_rad) per tag. Extrapolation
+    uses velocity (center displacement / frame) and angular velocity (delta_yaw / frame).
+    """
+
+    __slots__ = ("_per_tag", "_maxlen")
+
+    def __init__(self, maxlen: int = 5):
+        self._maxlen = max(2, maxlen)
+        self._per_tag: Dict[int, Deque[Tuple[int, np.ndarray, float]]] = {}
+
+    def update(self, frame_detections: FrameDetections, frame_idx: int) -> None:
+        """Append (frame_idx, center, yaw_rad) for each tag in frame_detections."""
+        for tag_id, tag in frame_detections.tags.items():
+            center = np.asarray([tag.center[0], tag.center[1]], dtype=np.float64)
+            yaw = _yaw_rad_from_tag_state(tag)
+            if tag_id not in self._per_tag:
+                self._per_tag[tag_id] = deque(maxlen=self._maxlen)
+            self._per_tag[tag_id].append((frame_idx, center, yaw))
+
+    def get_predicted_corners(
+        self,
+        tag_id: int,
+        prev_corners: np.ndarray,
+        prev_center: np.ndarray,
+        prev_frame_idx: int,
+        next_frame_idx: int,
+    ) -> Optional[np.ndarray]:
+        """
+        Predict corners at next_frame_idx assuming motion along an arc of unknown
+        radius. Rotation is taken from yaw change; radius is solved from the
+        isosceles triangle (apex angle = yaw change, base = displacement between
+        first and last history). Center of rotation is placed on the side of the
+        chord given by the sign of yaw change. Returns (4, 2) float64 or None.
+        """
+        history = self._per_tag.get(tag_id)
+        if not history or len(history) < 2:
+            return None
+        # Use last entry as "current" (prev frame); ensure it matches prev_frame_idx
+        f_last, c_last, y_last = history[-1]
+        if f_last != prev_frame_idx:
+            return None
+        prev_corners = np.asarray(prev_corners, dtype=np.float64).reshape(4, 2)
+        prev_center = np.asarray(prev_center, dtype=np.float64).reshape(2)
+
+        # Velocity: (last_center - first_center) / delta_frames (robust over K frames)
+        frames = list(history)
+        f0, c0, y0 = frames[0]
+        
+        c0, c_last = np.asarray(c0, dtype=np.float64), np.asarray(c_last, dtype=np.float64)
+        delta_f = float(f_last - f0)
+        if delta_f <= 0:
+            return None
+
+        yaw_diff = float(np.asarray(y_last, dtype=np.float64) - np.asarray(y0, dtype=np.float64))
+        yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
+        omega = yaw_diff / delta_f
+        dt = float(next_frame_idx - prev_frame_idx)
+        angle = omega * dt
+        c, s = np.cos(angle), np.sin(angle)
+        R_2d = np.array([[c, -s], [s, c]], dtype=np.float64)
+
+        # Arc-based center prediction
+        d = float(np.linalg.norm(c_last - c0))
+        theta_abs = abs(yaw_diff)
+        if theta_abs < 1e-9 or d < 1e-9:
+            # Near-linear or no translation: use constant-velocity center
+            velocity = (c_last - c0) / delta_f
+            predicted_center = prev_center + velocity * dt
+        else:
+            # Isosceles: apex angle = theta, base = d => chord = 2*R*sin(theta/2) => R = d / (2*sin(theta/2))
+            sin_half = np.sin(theta_abs / 2.0)
+            if sin_half < 1e-9:
+                velocity = (c_last - c0) / delta_f
+                predicted_center = prev_center + velocity * dt
+            else:
+                R = d / (2.0 * sin_half)
+                M = (c0 + c_last) * 0.5
+                V = c_last - c0
+                half_chord_sq = (d / 2.0) ** 2
+                h_sq = R * R - half_chord_sq
+                h = np.sqrt(max(0.0, h_sq))
+                perp = np.array([-V[1], V[0]], dtype=np.float64)
+                perp_norm = np.linalg.norm(perp)
+                if perp_norm < 1e-12:
+                    velocity = (c_last - c0) / delta_f
+                    predicted_center = prev_center + velocity * dt
+                else:
+                    n = (np.sign(yaw_diff) if yaw_diff != 0 else 1.0) * perp / perp_norm
+                    O = M + h * n
+                    predicted_center = O + (R_2d @ (prev_center - O))
+
+        offsets = (prev_corners - prev_center) @ R_2d.T
+        predicted_corners = predicted_center + offsets
+        return predicted_corners.astype(np.float64)
 
 
 def detections_to_frame_detections(
@@ -199,19 +316,26 @@ def _lk_track_points(
     next_gray: np.ndarray,
     pts_prev: np.ndarray,
     *,
+    next_pts_initial: Optional[np.ndarray] = None,
     win_size: Tuple[int, int] = (31, 31),
     max_level: int = 4,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     p0 = np.asarray(pts_prev, dtype=np.float32).reshape(-1, 1, 2)
+    if next_pts_initial is not None:
+        p1_init = np.asarray(next_pts_initial, dtype=np.float32).reshape(-1, 1, 2)
+        flags = cv2.OPTFLOW_USE_INITIAL_FLOW
+    else:
+        p1_init = None
+        flags = 0
     p1, st, err = cv2.calcOpticalFlowPyrLK(
         prev_gray,
         next_gray,
         p0,
-        None,
+        p1_init,
         winSize=win_size,
         maxLevel=max_level,
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-        flags=0,
+        flags=flags,
     )
     return p1.reshape(-1, 2).astype(np.float64), st.reshape(-1), err.reshape(-1)
 
@@ -247,12 +371,16 @@ def _recover_missing_tags_with_tracking(
     max_corner_err_px: float = 25.0,
     min_area_px2: float = 25.0,
     max_tagcoord_rmse: float = 0.25,
+    motion_history: Optional[MotionHistory] = None,
+    prev_frame_idx: Optional[int] = None,
 ) -> FrameDetections:
     """
     Generic helper for both fallback tracking modes.
 
     Given previous-frame detections and raw detections for the next frame,
     fill in tags that went missing by tracking their corners with LK optical flow.
+    When motion_history and prev_frame_idx are provided, uses velocity and angular
+    velocity from recent frames to supply an initial flow guess (OPTFLOW_USE_INITIAL_FLOW).
     """
     prev_ids = set(prev_detections.tags.keys())
     next_ids = set(raw_next.tags.keys())
@@ -261,14 +389,32 @@ def _recover_missing_tags_with_tracking(
         return raw_next
 
     final_tags = dict(raw_next.tags)
+    next_frame_idx = frame_idx
+    use_initial_flow = (
+        motion_history is not None
+        and prev_frame_idx is not None
+        and prev_frame_idx < next_frame_idx
+    )
 
     for tag_id in missing:
         prev_tag = prev_detections.tags.get(tag_id)
         if prev_tag is None:
             continue
         prev_corners = np.asarray(prev_tag.corners, dtype=np.float64).reshape(4, 2)
+        prev_center = np.array([prev_tag.center[0], prev_tag.center[1]], dtype=np.float64)
 
-        tracked, st, err = _lk_track_points(prev_frame_gray, next_frame_gray, prev_corners)
+        next_pts_initial: Optional[np.ndarray] = None
+        if use_initial_flow:
+            next_pts_initial = motion_history.get_predicted_corners(
+                tag_id, prev_corners, prev_center, prev_frame_idx, next_frame_idx
+            )
+
+        tracked, st, err = _lk_track_points(
+            prev_frame_gray,
+            next_frame_gray,
+            prev_corners,
+            next_pts_initial=next_pts_initial,
+        )
         if int(np.sum(st)) < 3:
             continue
         if float(np.max(err[st.astype(bool)])) > max_corner_err_px:
@@ -313,10 +459,14 @@ def track_apriltags_with_fallback(
     max_corner_err_px: float = 25.0,
     min_area_px2: float = 25.0,
     max_tagcoord_rmse: float = 0.25,
+    motion_history: Optional[MotionHistory] = None,
+    prev_frame_idx: Optional[int] = None,
 ) -> FrameDetections:
     """
     Detect tags in next_frame_gray; for tags missing relative to prev_detections,
     attempt recovery using per-tag LK tracking + local corner refinement.
+    Optionally use motion_history and prev_frame_idx to seed LK with an extrapolated
+    initial flow (velocity + angular velocity from recent frames).
 
     Notes:
     - This is intentionally *per-tag* (no global motion), suitable for fixed camera + locally moving tags.
@@ -325,7 +475,6 @@ def track_apriltags_with_fallback(
     raw = detect_to_frame_detections(
         detector, next_frame_gray, frame_idx=frame_idx, tag_size=tag_size
     )
-    # Delegate to the generic recovery function
     return _recover_missing_tags_with_tracking(
         prev_frame_gray,
         prev_detections,
@@ -336,6 +485,8 @@ def track_apriltags_with_fallback(
         max_corner_err_px=max_corner_err_px,
         min_area_px2=min_area_px2,
         max_tagcoord_rmse=max_tagcoord_rmse,
+        motion_history=motion_history,
+        prev_frame_idx=prev_frame_idx,
     )
 
 
@@ -350,16 +501,19 @@ def track_pose_detections_with_fallback(
     max_corner_err_px: float = 25.0,
     min_area_px2: float = 25.0,
     max_tagcoord_rmse: float = 0.25,
+    motion_history: Optional[MotionHistory] = None,
+    prev_frame_idx: Optional[int] = None,
 ) -> FrameDetections:
     """
     Given previous-frame detections and raw detections for the next frame (both
     based on the pose-estimation detector output), fill in tags that went
     missing by tracking their corners with LK optical flow.
+    Optionally use motion_history and prev_frame_idx to seed LK with an
+    extrapolated initial flow (velocity + angular velocity from recent frames).
 
     This variant uses only image-space tracking but still computes a
     camera->tag-plane homography from the recovered corners for convenience.
     """
-    # Delegate to the generic recovery function
     return _recover_missing_tags_with_tracking(
         prev_frame_gray,
         prev_detections,
@@ -370,4 +524,6 @@ def track_pose_detections_with_fallback(
         max_corner_err_px=max_corner_err_px,
         min_area_px2=min_area_px2,
         max_tagcoord_rmse=max_tagcoord_rmse,
+        motion_history=motion_history,
+        prev_frame_idx=prev_frame_idx,
     )
