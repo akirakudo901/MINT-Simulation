@@ -34,6 +34,7 @@ from tqdm import tqdm
 
 from apriltag_tracking import (
     FrameDetections,
+    MotionHistory,
     detections_to_frame_detections,
     track_pose_detections_with_fallback,
 )
@@ -59,7 +60,7 @@ DETECTOR_KWARGS = dict(
     quad_decimate=1.0,   # 2 = run quad detection on 1/2 resolution (faster, slightly less accurate)
     quad_sigma=0,
     refine_edges=0, # outside of 0, improves detection (?) but reduces accuracy
-    decode_sharpening=0.25, #extend of sharpening of image, set to 0 might help with computation?
+    decode_sharpening=0, #extend of sharpening of image, set to 0 might help with computation?
     debug=0,
 )
 
@@ -359,9 +360,12 @@ def _process_frame_and_collect(
     prev_gray: Optional[np.ndarray] = None,
     prev_frame_dets: Optional[FrameDetections] = None,
     csv_rows: Optional[list[dict]] = None,
+    motion_history: Optional[MotionHistory] = None,
 ) -> tuple[list, Optional[np.ndarray], Optional[FrameDetections]]:
     """
     Detect tags in a frame, optionally perform fallback tracking, and append pose rows.
+    When motion_history is provided and fallback is used, LK tracking is seeded with
+    an extrapolated initial flow from recent velocity and angular velocity.
 
     Returns:
         detections, new_prev_gray, new_prev_frame_dets
@@ -390,6 +394,8 @@ def _process_frame_and_collect(
                 raw_next_fd,
                 frame_idx=frame_idx,
                 tag_size=float(tag_size_m) if tag_size_m is not None else 1.0,
+                motion_history=motion_history,
+                prev_frame_idx=frame_idx - 1,
             )
             existing_ids = {int(d.tag_id) for d in detections}
             for tag_id, ts in frame_dets.tags.items():
@@ -410,6 +416,8 @@ def _process_frame_and_collect(
             prev_frame_dets = frame_dets
         else:
             prev_frame_dets = raw_next_fd
+        if motion_history is not None:
+            motion_history.update(prev_frame_dets, frame_idx)
     else:
         detections = detector.detect(gray)
         prev_frame_dets = None
@@ -614,6 +622,7 @@ def run_on_source(
         """
         prev_gray = None
         prev_frame_dets = None
+        motion_history = MotionHistory(maxlen=5) if (use_fallback_tracking and use_pose) else None
 
         if segment_range is not None:
             start, end = segment_range
@@ -640,6 +649,7 @@ def run_on_source(
                 prev_gray=prev_gray,
                 prev_frame_dets=prev_frame_dets,
                 csv_rows=csv_rows if (use_pose and output_csv) else None,
+                motion_history=motion_history,
             )
 
             if show:
