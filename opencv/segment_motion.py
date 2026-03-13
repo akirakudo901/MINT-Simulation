@@ -538,11 +538,11 @@ def render_segment_videos(
                 center_x = float(row["center_x"])
                 center_y = float(row["center_y"])
                 yaw_deg = float(row["yaw_deg"])
-                pitch_deg = row.get("pitch_deg")
-                roll_deg = row.get("roll_deg")
-                x_cam = row.get("x")
-                y_cam = row.get("y")
-                z_cam = row.get("z", "") != "" else None
+                pitch_deg = row["pitch_deg"] if row.get("pitch_deg", "") != "" else None
+                roll_deg = row["roll_deg"] if row.get("roll_deg", "") != "" else None
+                x_cam = row["x"] if row.get("x", "") != "" else None
+                y_cam = row["y"] if row.get("y", "") != "" else None
+                z_cam = row["z"] if row.get("z", "") != "" else None
                 tracked_flag = row.get("tracked", 0)
                 try:
                     tracked_flag = int(tracked_flag)
