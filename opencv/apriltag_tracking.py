@@ -236,80 +236,7 @@ def _refine_corners_subpix(
     return refined.reshape(-1, 2).astype(np.float64)
 
 
-def track_apriltags_with_fallback(
-    detector: Detector,
-    prev_frame_gray: np.ndarray,
-    prev_detections: FrameDetections,
-    next_frame_gray: np.ndarray,
-    *,
-    frame_idx: int,
-    tag_size: float = 1.0,
-    max_corner_err_px: float = 25.0,
-    min_area_px2: float = 25.0,
-    max_tagcoord_rmse: float = 0.25,
-) -> FrameDetections:
-    """
-    Detect tags in next_frame_gray; for tags missing relative to prev_detections,
-    attempt recovery using per-tag LK tracking + local corner refinement.
-
-    Notes:
-    - This is intentionally *per-tag* (no global motion), suitable for fixed camera + locally moving tags.
-    - H_cam_to_tag is computed from corners as image->tag-plane homography.
-    """
-    raw = detect_to_frame_detections(
-        detector, next_frame_gray, frame_idx=frame_idx, tag_size=tag_size
-    )
-    prev_ids = set(prev_detections.tags.keys())
-    next_ids = set(raw.tags.keys())
-    missing = sorted(prev_ids - next_ids)
-    if not missing:
-        return raw
-
-    final_tags = dict(raw.tags)
-
-    for tag_id in missing:
-        prev_tag = prev_detections.tags.get(tag_id)
-        if prev_tag is None:
-            continue
-        prev_corners = np.asarray(prev_tag.corners, dtype=np.float64).reshape(4, 2)
-
-        tracked, st, err = _lk_track_points(prev_frame_gray, next_frame_gray, prev_corners)
-        if int(np.sum(st)) < 3:
-            continue
-        if float(np.max(err[st.astype(bool)])) > max_corner_err_px:
-            continue
-
-        # Local subpixel refinement in the new frame.
-        refined = _refine_corners_subpix(next_frame_gray, tracked)
-
-        if not _is_convex_quad(refined):
-            continue
-        if _quad_area(refined) < min_area_px2:
-            continue
-
-        H, rmse = _fit_and_score_homography_cam_to_tag(refined, tag_size=tag_size)
-        if rmse > max_tagcoord_rmse:
-            continue
-
-        center = refined.mean(axis=0)
-        # Confidence: combine flow quality + homography reprojection quality.
-        flow_quality = float(np.exp(-float(np.mean(err[st.astype(bool)])) / 10.0))
-        reproj_quality = float(np.exp(-rmse))
-        conf = float(np.clip(0.5 * flow_quality + 0.5 * reproj_quality, 0.0, 1.0))
-
-        final_tags[tag_id] = TagState(
-            tag_id=tag_id,
-            corners=refined,
-            center=(float(center[0]), float(center[1])),
-            H_cam_to_tag=H,
-            source="tracked",
-            confidence=conf,
-        )
-
-    return FrameDetections(frame_idx=frame_idx, tags=final_tags)
-
-
-def track_pose_detections_with_fallback(
+def _recover_missing_tags_with_tracking(
     prev_frame_gray: np.ndarray,
     prev_detections: FrameDetections,
     next_frame_gray: np.ndarray,
@@ -322,12 +249,10 @@ def track_pose_detections_with_fallback(
     max_tagcoord_rmse: float = 0.25,
 ) -> FrameDetections:
     """
-    Given previous-frame detections and raw detections for the next frame (both
-    based on the pose-estimation detector output), fill in tags that went
-    missing by tracking their corners with LK optical flow.
+    Generic helper for both fallback tracking modes.
 
-    This variant uses only image-space tracking but still computes a
-    camera->tag-plane homography from the recovered corners for convenience.
+    Given previous-frame detections and raw detections for the next frame,
+    fill in tags that went missing by tracking their corners with LK optical flow.
     """
     prev_ids = set(prev_detections.tags.keys())
     next_ids = set(raw_next.tags.keys())
@@ -356,10 +281,7 @@ def track_pose_detections_with_fallback(
         if _quad_area(refined) < min_area_px2:
             continue
 
-        # Fit homography and reject if reprojection in tag coords is too large.
-        H, rmse = _fit_and_score_homography_cam_to_tag(
-            refined, tag_size=tag_size
-        )
+        H, rmse = _fit_and_score_homography_cam_to_tag(refined, tag_size=tag_size)
         if rmse > max_tagcoord_rmse:
             continue
 
@@ -379,3 +301,73 @@ def track_pose_detections_with_fallback(
 
     return FrameDetections(frame_idx=frame_idx, tags=final_tags)
 
+
+def track_apriltags_with_fallback(
+    detector: Detector,
+    prev_frame_gray: np.ndarray,
+    prev_detections: FrameDetections,
+    next_frame_gray: np.ndarray,
+    *,
+    frame_idx: int,
+    tag_size: float = 1.0,
+    max_corner_err_px: float = 25.0,
+    min_area_px2: float = 25.0,
+    max_tagcoord_rmse: float = 0.25,
+) -> FrameDetections:
+    """
+    Detect tags in next_frame_gray; for tags missing relative to prev_detections,
+    attempt recovery using per-tag LK tracking + local corner refinement.
+
+    Notes:
+    - This is intentionally *per-tag* (no global motion), suitable for fixed camera + locally moving tags.
+    - H_cam_to_tag is computed from corners as image->tag-plane homography.
+    """
+    raw = detect_to_frame_detections(
+        detector, next_frame_gray, frame_idx=frame_idx, tag_size=tag_size
+    )
+    # Delegate to the generic recovery function
+    return _recover_missing_tags_with_tracking(
+        prev_frame_gray,
+        prev_detections,
+        next_frame_gray,
+        raw,
+        frame_idx=frame_idx,
+        tag_size=tag_size,
+        max_corner_err_px=max_corner_err_px,
+        min_area_px2=min_area_px2,
+        max_tagcoord_rmse=max_tagcoord_rmse,
+    )
+
+
+def track_pose_detections_with_fallback(
+    prev_frame_gray: np.ndarray,
+    prev_detections: FrameDetections,
+    next_frame_gray: np.ndarray,
+    raw_next: FrameDetections,
+    *,
+    frame_idx: int,
+    tag_size: float = 1.0,
+    max_corner_err_px: float = 25.0,
+    min_area_px2: float = 25.0,
+    max_tagcoord_rmse: float = 0.25,
+) -> FrameDetections:
+    """
+    Given previous-frame detections and raw detections for the next frame (both
+    based on the pose-estimation detector output), fill in tags that went
+    missing by tracking their corners with LK optical flow.
+
+    This variant uses only image-space tracking but still computes a
+    camera->tag-plane homography from the recovered corners for convenience.
+    """
+    # Delegate to the generic recovery function
+    return _recover_missing_tags_with_tracking(
+        prev_frame_gray,
+        prev_detections,
+        next_frame_gray,
+        raw_next,
+        frame_idx=frame_idx,
+        tag_size=tag_size,
+        max_corner_err_px=max_corner_err_px,
+        min_area_px2=min_area_px2,
+        max_tagcoord_rmse=max_tagcoord_rmse,
+    )
