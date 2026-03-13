@@ -749,6 +749,24 @@ def main():
     parser.add_argument("--width", type=int, default=None, help="Camera frame width (e.g. 640)")
     parser.add_argument("--height", type=int, default=None, help="Camera frame height")
     parser.add_argument(
+        "--nthreads",
+        type=int,
+        default=None,
+        help="Override AprilTag detector nthreads (default from DETECTOR_KWARGS).",
+    )
+    parser.add_argument(
+        "--quad-sigma",
+        type=float,
+        default=None,
+        help="Override AprilTag detector quad_sigma (default from DETECTOR_KWARGS).",
+    )
+    parser.add_argument(
+        "--decode-sharpening",
+        type=float,
+        default=None,
+        help="Override AprilTag detector decode_sharpening (default from DETECTOR_KWARGS).",
+    )
+    parser.add_argument(
         "--analyze",
         action="store_true",
         help="Run headless analysis: detect tags on all frames (no rendering), show tqdm progress, write stats to a txt file.",
@@ -795,6 +813,14 @@ def main():
         help="When pose estimation is OFF, recover missing tags using per-tag optical-flow tracking between frames.",
     )
     args = parser.parse_args()
+
+    # Apply optional detector overrides before creating any Detector instances.
+    if args.nthreads is not None:
+        DETECTOR_KWARGS["nthreads"] = int(args.nthreads)
+    if args.quad_sigma is not None:
+        DETECTOR_KWARGS["quad_sigma"] = float(args.quad_sigma)
+    if args.decode_sharpening is not None:
+        DETECTOR_KWARGS["decode_sharpening"] = float(args.decode_sharpening)
 
     camera_intrinsics: Optional[tuple[float, float, float, float]] = None
     if args.intrinsics:
