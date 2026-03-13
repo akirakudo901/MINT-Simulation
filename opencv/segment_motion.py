@@ -713,7 +713,7 @@ def main() -> None:
         "--pose-csv",
         type=Path,
         default=None,
-        help="Pose CSV (frame, tag_id, center_x, center_y, yaw_deg, ...) to draw yaw arrows on video frames.",
+        help="Pose CSV (frame, tag_id, center_x, center_y, yaw_deg, ...) to draw yaw arrows on video. Set to csv_path if not given but --video is.",
     )
     parser.add_argument(
         "--intrinsics",
@@ -722,6 +722,11 @@ def main() -> None:
         help="Camera intrinsics 'fx,fy,cx,cy' for 3D yaw arrow projection (optional).",
     )
     args = parser.parse_args()
+
+    # If we are running video segmentation and no explicit pose CSV is provided,
+    # default the pose CSV to the main input CSV path.
+    if args.video is not None and args.pose_csv is None:
+        args.pose_csv = args.csv_path
 
     speeds_df = compute_tag_speeds(
         args.csv_path,
