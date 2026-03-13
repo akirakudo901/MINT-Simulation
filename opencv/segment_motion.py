@@ -542,12 +542,20 @@ def render_segment_videos(
                 roll_deg = row.get("roll_deg")
                 x_cam = row.get("x")
                 y_cam = row.get("y")
-                z_cam = row.get("z")
+                z_cam = row.get("z", "") != "" else None
+                tracked_flag = row.get("tracked", 0)
+                try:
+                    tracked_flag = int(tracked_flag)
+                except Exception:
+                    tracked_flag = 0
                 # Pass 3D pose only when all values are present and non-NaN
                 def _f(v):
                     if v is None or (isinstance(v, float) and np.isnan(v)):
                         return None
                     return float(v)
+                # Color arrows differently when the tag location was tracked vs detected.
+                # BGR: detected=red, tracked=yellow.
+                arrow_color = (0, 255, 255) if tracked_flag == 1 else (0, 0, 255)
                 draw_yaw_arrow(
                     frame,
                     center_x,
@@ -561,6 +569,7 @@ def render_segment_videos(
                     camera_intrinsics=camera_intrinsics,
                     axis_length_m=yaw_arrow_length_m,
                     arrow_length_px=yaw_arrow_length_px,
+                    color=arrow_color,
                 )
             writer.write(frame)
 
