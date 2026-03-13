@@ -18,8 +18,12 @@ class TagState:
     tag_id: int
     corners: Corners  # (4, 2) in pixels, order as returned by pupil_apriltags
     center: Center
-    # Optional image->tag-plane homography; may be unused in some pipelines.
+    # Optional image->tag-plane homography; may be unused when pose is available.
     H_cam_to_tag: Optional[Homography] = None
+    # Optional full pose from pupil_apriltags (camera frame).
+    pose_R: Optional[np.ndarray] = None  # 3x3
+    pose_t: Optional[np.ndarray] = None  # 3x1 or (3,)
+    pose_err: Optional[float] = None
     # "detected" | "tracked"
     source: str = "detected"
     confidence: float = 1.0
@@ -46,9 +50,32 @@ def detections_to_frame_detections(
     for d in detections:
         corners = np.asarray(d.corners, dtype=np.float64).reshape(4, 2)
         center = (float(d.center[0]), float(d.center[1]))
+
+        # If pose is available (from pupil_apriltags pose mode), prefer that over
+        # computing a homography. This "replaces" the homography with the pose.
+        pose_R: Optional[np.ndarray] = None
+        pose_t: Optional[np.ndarray] = None
+        pose_err: Optional[float] = None
+        if hasattr(d, "pose_R") and getattr(d, "pose_R") is not None:
+            pose_R = np.asarray(d.pose_R, dtype=np.float64).reshape(3, 3)
+            if hasattr(d, "pose_t") and getattr(d, "pose_t") is not None:
+                pose_t = np.asarray(d.pose_t, dtype=np.float64).reshape(-1)
+            if hasattr(d, "pose_err"):
+                try:
+                    pose_err = float(d.pose_err)
+                except Exception:
+                    pose_err = None
+
         H: Optional[Homography]
         conf: float
-        if compute_homography:
+        if pose_R is not None:
+            # Confidence based on pose error if available; fall back to 1.0.
+            if pose_err is not None:
+                conf = float(np.exp(-abs(pose_err)))
+            else:
+                conf = 1.0
+            H = None
+        elif compute_homography:
             H, rmse = _fit_and_score_homography_cam_to_tag(
                 corners, tag_size=tag_size
             )
@@ -61,6 +88,9 @@ def detections_to_frame_detections(
             corners=corners,
             center=center,
             H_cam_to_tag=H,
+            pose_R=pose_R,
+            pose_t=pose_t,
+            pose_err=pose_err,
             source="detected",
             confidence=conf,
         )

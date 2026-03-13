@@ -366,7 +366,7 @@ def run_on_source(
             raw_next_fd = detections_to_frame_detections(
                 detections,
                 frame_idx=frame_idx,
-                compute_homography=True,
+                compute_homography=False,
                 tag_size=float(tag_size_m) if tag_size_m is not None else 1.0,
             )
             if use_fallback_tracking and prev_gray is not None and prev_frame_dets is not None:
