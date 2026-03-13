@@ -113,8 +113,8 @@ def homography_cam_to_tag_from_corners(
     """
     img = np.asarray(corners_px, dtype=np.float64).reshape(4, 2)
     tag = _tag_corners_tagcoords(tag_size=tag_size)
-    # OpenCV expects float32/64; getPerspectiveTransform gives tag<-img transform.
-    H = cv2.getPerspectiveTransform(img.astype(np.float64), tag.astype(np.float64))
+    # OpenCV expects float32; getPerspectiveTransform gives tag<-img transform.
+    H = cv2.getPerspectiveTransform(img.astype(np.float32), tag.astype(np.float32))
     return H
 
 
