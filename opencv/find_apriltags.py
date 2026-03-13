@@ -171,6 +171,51 @@ def project_camera_to_image(
     return (u, v)
 
 
+def homography_to_rotation(
+    H_cam_to_tag: np.ndarray,
+    camera_intrinsics: tuple[float, float, float, float],
+) -> np.ndarray:
+    """
+    Approximate rotation matrix from image->tag-plane homography and intrinsics.
+
+    H_cam_to_tag maps image pixels -> tag-plane coords. We invert it to get the usual
+    tag-plane -> image homography and then decompose:
+        s * p_img = K [r1 r2 t] p_tag
+    returning R = [r1 r2 r3] with r3 = r1 x r2, re-orthonormalized.
+    """
+    fx, fy, cx, cy = camera_intrinsics
+    K = np.array(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    K_inv = np.linalg.inv(K)
+
+    # Convert image->tag homography to tag->image for decomposition.
+    H_tag_to_img = np.linalg.inv(H_cam_to_tag)
+    h1 = H_tag_to_img[:, 0]
+    h2 = H_tag_to_img[:, 1]
+
+    Kinv_h1 = K_inv @ h1
+    Kinv_h2 = K_inv @ h2
+    lam = 1.0 / np.linalg.norm(Kinv_h1)
+    r1 = lam * Kinv_h1
+    r2 = lam * Kinv_h2
+    r3 = np.cross(r1, r2)
+
+    R_approx = np.column_stack((r1, r2, r3))
+    # Orthonormalize to the closest proper rotation matrix.
+    U, _, Vt = np.linalg.svd(R_approx)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1.0
+        R = U @ Vt
+    return R
+
+
 def draw_yaw_arrow(
     frame: np.ndarray,
     center_x: float,
@@ -291,6 +336,7 @@ def run_on_source(
     camera_intrinsics: Optional (fx, fy, cx, cy) for pose estimation. When set with tag_size_m, enables pose.
     tag_size_m: Physical AprilTag size in meters. When set with camera_intrinsics, enables pose estimation.
     output_csv: If set and pose estimation is enabled, writes position & angle per tag per frame to this CSV file.
+        Adds column `tracked` where 0=detected, 1=tracked (fallback tracking).
     """
     use_pose = (
         camera_intrinsics is not None
@@ -403,42 +449,60 @@ def run_on_source(
             prev_frame_dets = None
         prev_gray = gray
 
-        for d in detections:
-            x, y = d.center
-            if use_pose and hasattr(d, "pose_t") and d.pose_t is not None:
-                t = d.pose_t.flatten()
-                x_cam, y_cam, z_cam = float(t[0]), float(t[1]), float(t[2])
-                yaw_deg, pitch_deg, roll_deg = rotation_matrix_to_euler_deg(d.pose_R)
+        if use_pose and output_csv and prev_frame_dets is not None:
+            # Save one row per (frame, tag_id) from the merged detections (detected + tracked fallback).
+            for tag_id, ts in prev_frame_dets.tags.items():
+                x, y = ts.center
+                c = ts.corners  # 4x2 in pixel coords
+                tracked_flag = 1 if ts.source == "tracked" else 0
 
-                if output_csv:
-                    c = d.corners  # 4x2 array in pixel coordinates
-                    csv_rows.append({
-                        "frame": frame_idx,
-                        "tag_id": d.tag_id,
-                        "x": x_cam,
-                        "y": y_cam,
-                        "z": z_cam,
-                        "yaw_deg": yaw_deg,
-                        "pitch_deg": pitch_deg,
-                        "roll_deg": roll_deg,
-                        "center_x": float(x),
-                        "center_y": float(y),
-                        "c0_x": float(c[0][0]),
-                        "c0_y": float(c[0][1]),
-                        "c1_x": float(c[1][0]),
-                        "c1_y": float(c[1][1]),
-                        "c2_x": float(c[2][0]),
-                        "c2_y": float(c[2][1]),
-                        "c3_x": float(c[3][0]),
-                        "c3_y": float(c[3][1]),
-                    })
-                if PRINT:
+                pose_R, pose_t = ts.pose_R, ts.pose_t
+                x_cam = y_cam = z_cam = None
+                yaw_deg = pitch_deg = roll_deg = None
+
+                if pose_R is not None and pose_t is not None:
+                    # Direct pose from detector.
+                    t = np.asarray(pose_t, dtype=np.float64).reshape(-1)
+                    x_cam, y_cam, z_cam = float(t[0]), float(t[1]), float(t[2])
+                    yaw_deg, pitch_deg, roll_deg = rotation_matrix_to_euler_deg(
+                        np.asarray(pose_R, dtype=np.float64).reshape(3, 3)
+                    )
+                elif tracked_flag == 1 and ts.H_cam_to_tag is not None and camera_intrinsics is not None:
+                    # Tracked-only: no x,y,z; recover orientation from homography.
+                    R_from_H = homography_to_rotation(ts.H_cam_to_tag, camera_intrinsics)
+                    yaw_deg, pitch_deg, roll_deg = rotation_matrix_to_euler_deg(R_from_H)
+
+                csv_rows.append({
+                    "frame": frame_idx,
+                    "tag_id": int(tag_id),
+                    "tracked": tracked_flag,  # 0=detected, 1=tracked
+                    "x": x_cam,
+                    "y": y_cam,
+                    "z": z_cam,
+                    "yaw_deg": yaw_deg,
+                    "pitch_deg": pitch_deg,
+                    "roll_deg": roll_deg,
+                    "center_x": float(x),
+                    "center_y": float(y),
+                    "c0_x": float(c[0][0]),
+                    "c0_y": float(c[0][1]),
+                    "c1_x": float(c[1][0]),
+                    "c1_y": float(c[1][1]),
+                    "c2_x": float(c[2][0]),
+                    "c2_y": float(c[2][1]),
+                    "c3_x": float(c[3][0]),
+                    "c3_y": float(c[3][1]),
+                })
+
+                if PRINT and yaw_deg is not None:
                     print(
-                        f"Frame {frame_idx}: tag_id={d.tag_id} center=({x:.1f}, {y:.1f}) "
+                        f"Frame {frame_idx}: tag_id={tag_id} tracked={tracked_flag} center=({x:.1f}, {y:.1f}) "
                         f"pose x={x_cam:.4f} y={y_cam:.4f} z={z_cam:.4f} "
                         f"yaw={yaw_deg:.2f}° pitch={pitch_deg:.2f}° roll={roll_deg:.2f}°"
                     )
-            else:
+        else:
+            for d in detections:
+                x, y = d.center
                 if PRINT:
                     print(f"Frame {frame_idx}: tag_id={d.tag_id} center=({x:.1f}, {y:.1f}) corners={d.corners.tolist()}")
 
@@ -492,6 +556,7 @@ def run_on_source(
         fieldnames = [
             "frame",
             "tag_id",
+            "tracked",
             "x",
             "y",
             "z",
@@ -722,7 +787,7 @@ def main():
         type=str,
         default=None,
         metavar="PATH",
-        help="Write pose (frame, tag_id, x, y, z, yaw_deg, pitch_deg, roll_deg) to CSV. Requires pose estimation (--intrinsics and --tag-size).",
+        help="Write pose (frame, tag_id, tracked, x, y, z, yaw_deg, pitch_deg, roll_deg) to CSV. Requires pose estimation (--intrinsics and --tag-size).",
     )
     parser.add_argument(
         "--fallback-tracking",
