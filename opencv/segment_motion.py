@@ -467,19 +467,33 @@ def render_segment_videos(
         raise FileNotFoundError(f"Video file not found: {video_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load pose CSV for yaw arrows if requested
+    # Load pose CSV for yaw arrows and tag corner visualization if requested
     pose_by_frame: dict[int, list[dict]] = {}
+    has_corner_columns = False
     if pose_csv is not None:
         pose_path = Path(pose_csv)
         if not pose_path.exists():
             raise FileNotFoundError(f"Pose CSV not found: {pose_path}")
         pose_df = pd.read_csv(pose_path)
-        for col in ["frame", "tag_id", "center_x", "center_y", "yaw_deg"]:
+        base_required_cols = ["frame", "tag_id", "center_x", "center_y", "yaw_deg"]
+        for col in base_required_cols:
             if col not in pose_df.columns:
                 raise ValueError(
                     f"Pose CSV must have columns frame, tag_id, center_x, center_y, yaw_deg. "
                     f"Found: {list(pose_df.columns)}"
                 )
+        corner_cols = [
+            "c0_x",
+            "c0_y",
+            "c1_x",
+            "c1_y",
+            "c2_x",
+            "c2_y",
+            "c3_x",
+            "c3_y",
+        ]
+        has_corner_columns = all(col in pose_df.columns for col in corner_cols)
+
         for frame_idx, group in pose_df.groupby("frame", sort=True):
             pose_by_frame[int(frame_idx)] = group.to_dict("records")
 
@@ -533,7 +547,7 @@ def render_segment_videos(
                     (0, 255, 0),
                     2,
                 )
-            # Draw yaw arrow for each tag in this frame when pose_csv is provided
+            # Draw yaw arrow and tag geometry for each tag in this frame when pose_csv is provided
             for row in pose_by_frame.get(global_frame, []):
                 center_x = float(row["center_x"])
                 center_y = float(row["center_y"])
@@ -544,6 +558,7 @@ def render_segment_videos(
                 y_cam = row["y"] if row.get("y", "") != "" else None
                 z_cam = row["z"] if row.get("z", "") != "" else None
                 tracked_flag = row.get("tracked", 0)
+                tag_id = row.get("tag_id", None)
                 try:
                     tracked_flag = int(tracked_flag)
                 except Exception:
@@ -556,6 +571,41 @@ def render_segment_videos(
                 # Color arrows differently when the tag location was tracked vs detected.
                 # BGR: detected=red, tracked=yellow.
                 arrow_color = (0, 255, 255) if tracked_flag == 1 else (0, 0, 255)
+
+                # Optionally draw the tag's quadrilateral boundary and per-corner indices
+                if has_corner_columns:
+                    try:
+                        c0 = (int(round(float(row["c0_x"]))), int(round(float(row["c0_y"]))))
+                        c1 = (int(round(float(row["c1_x"]))), int(round(float(row["c1_y"]))))
+                        c2 = (int(round(float(row["c2_x"]))), int(round(float(row["c2_y"]))))
+                        c3 = (int(round(float(row["c3_x"]))), int(round(float(row["c3_y"]))))
+                        corners = [c0, c1, c2, c3]
+                        # Draw boundary lines in the same color as the yaw arrow
+                        for p_start, p_end in zip(corners, corners[1:] + corners[:1]):
+                            cv2.line(
+                                frame,
+                                p_start,
+                                p_end,
+                                arrow_color,
+                                thickness=2,
+                                lineType=cv2.LINE_AA,
+                            )
+                        # Label each corner with its index (0–3) near the corner location
+                        for idx, (cx_i, cy_i) in enumerate(corners):
+                            cv2.putText(
+                                frame,
+                                str(idx),
+                                (cx_i + 3, cy_i - 3),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.4,
+                                arrow_color,
+                                1,
+                                lineType=cv2.LINE_AA,
+                            )
+                    except Exception:
+                        # If any corner values are missing or invalid, skip drawing corners for this tag.
+                        pass
+
                 draw_yaw_arrow(
                     frame,
                     center_x,
@@ -571,6 +621,22 @@ def render_segment_videos(
                     arrow_length_px=yaw_arrow_length_px,
                     color=arrow_color,
                 )
+                # Draw the tag ID label near the tag center, similar to run_on_source.
+                if tag_id is not None:
+                    try:
+                        tag_label = str(int(tag_id))
+                    except Exception:
+                        tag_label = str(tag_id)
+                    cv2.putText(
+                        frame,
+                        tag_label,
+                        (int(round(center_x)) + 5, int(round(center_y)) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        arrow_color,
+                        1,
+                        lineType=cv2.LINE_AA,
+                    )
             writer.write(frame)
 
         writer.release()
