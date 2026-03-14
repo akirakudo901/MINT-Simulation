@@ -442,6 +442,7 @@ def render_segment_videos(
     yaw_arrow_length_m: float = 0.05,
     yaw_arrow_length_px: float = 40.0,
     gradient_videos: bool = False,
+    draw_tag_overlay: bool = True,
 ) -> list[Path]:
     """
     Render each segment as a separate video file. Optionally include padding_frames
@@ -456,6 +457,9 @@ def render_segment_videos(
     gray_to_gradient_for_lk) before any overlays. Two videos are rendered per segment:
     one for Sobel X and one for Sobel Y.
 
+    When draw_tag_overlay is False, the tag borders and corner counts aren't drawn on 
+    the frames.
+
     Args:
         video_path: Path to the source video.
         segments: List of (start_frame, end_frame) from find_movement_segments.
@@ -469,6 +473,7 @@ def render_segment_videos(
         yaw_arrow_length_px: Length of the 2D yaw arrow in pixels (when not using 3D).
         gradient_videos: If True, convert each frame to gradients and write two videos per
             segment (Sobel X and Sobel Y); overlays are drawn on top of the gradient frames.
+        draw_tag_overlay: If False, do not draw tag borders and corner counts.
 
     Returns:
         List of paths to the written video files.
@@ -584,6 +589,7 @@ def render_segment_videos(
                         (0, 255, 0),
                         2,
                     )
+                
                 # Draw yaw arrow and tag geometry for each tag in this frame when pose_csv is provided
                 for row in pose_by_frame.get(global_frame, []):
                     center_x = float(row["center_x"])
@@ -610,7 +616,7 @@ def render_segment_videos(
                     arrow_color = (0, 255, 255) if tracked_flag == 1 else (0, 0, 255)
 
                     # Optionally draw the tag's quadrilateral boundary and per-corner indices
-                    if has_corner_columns:
+                    if has_corner_columns and draw_tag_overlay:
                         try:
                             c0 = (int(round(float(row["c0_x"]))), int(round(float(row["c0_y"]))))
                             c1 = (int(round(float(row["c1_x"]))), int(round(float(row["c1_y"]))))
@@ -764,6 +770,11 @@ def main() -> None:
         action="store_true",
         help="Render gradient videos: two videos per segment (Sobel X and Sobel Y) with frames converted via gray_to_gradient_for_lk before overlays.",
     )
+    parser.add_argument(
+        "--no-tag-overlays",
+        action="store_true",
+        help="Do not draw tag borders and corner counts on frames.",
+    )
     args = parser.parse_args()
 
     # If we are running video segmentation and no explicit pose CSV is provided,
@@ -815,6 +826,7 @@ def main() -> None:
             pose_csv=args.pose_csv,
             camera_intrinsics=camera_intrinsics,
             gradient_videos=args.gradient_videos,
+            draw_tag_overlay=not args.no_tag_overlays,
         )
         print(f"Wrote {len(paths)} video(s) to {out_dir}")
 
