@@ -30,6 +30,11 @@ try:
 except ImportError:
     from opencv.find_apriltags import draw_yaw_arrow
 
+try:
+    from apriltag_tracking import gray_to_gradient_for_lk
+except ImportError:
+    from opencv.apriltag_tracking import gray_to_gradient_for_lk
+
 
 def compute_tag_speeds(
     csv_path: str | Path,
@@ -436,6 +441,7 @@ def render_segment_videos(
     camera_intrinsics: tuple[float, float, float, float] | None = None,
     yaw_arrow_length_m: float = 0.05,
     yaw_arrow_length_px: float = 40.0,
+    gradient_videos: bool = False,
 ) -> list[Path]:
     """
     Render each segment as a separate video file. Optionally include padding_frames
@@ -445,6 +451,10 @@ def render_segment_videos(
     If camera_intrinsics is also provided (and the CSV has x, y, z, yaw_deg, pitch_deg,
     roll_deg), the arrow is the projected 3D X axis (same as run_on_source in
     find_apriltags). Otherwise the arrow is drawn in the image plane from yaw_deg.
+
+    When gradient_videos is True, frames are converted to Sobel gradients (using
+    gray_to_gradient_for_lk) before any overlays. Two videos are rendered per segment:
+    one for Sobel X and one for Sobel Y.
 
     Args:
         video_path: Path to the source video.
@@ -457,6 +467,8 @@ def render_segment_videos(
         camera_intrinsics: Optional (fx, fy, cx, cy) for 3D yaw arrow projection.
         yaw_arrow_length_m: Length of the 3D yaw axis in meters (when using camera_intrinsics).
         yaw_arrow_length_px: Length of the 2D yaw arrow in pixels (when not using 3D).
+        gradient_videos: If True, convert each frame to gradients and write two videos per
+            segment (Sobel X and Sobel Y); overlays are drawn on top of the gradient frames.
 
     Returns:
         List of paths to the written video files.
@@ -518,12 +530,25 @@ def render_segment_videos(
         read_end = min(total_frames_video - 1, end + padding_frames)
         num_frames = read_end - read_start + 1
 
-        out_name = f"{video_path.stem}_segment_{seg_idx:03d}_frames_{read_start}-{read_end}.mp4"
-        out_path = output_dir / out_name
-
-        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
-        if not writer.isOpened():
-            raise IOError(f"Could not create video: {out_path}")
+        if gradient_videos:
+            out_name_x = f"{video_path.stem}_segment_{seg_idx:03d}_sobel_x_frames_{read_start}-{read_end}.mp4"
+            out_name_y = f"{video_path.stem}_segment_{seg_idx:03d}_sobel_y_frames_{read_start}-{read_end}.mp4"
+            out_path_x = output_dir / out_name_x
+            out_path_y = output_dir / out_name_y
+            writer_x = cv2.VideoWriter(str(out_path_x), fourcc, fps, (width, height))
+            writer_y = cv2.VideoWriter(str(out_path_y), fourcc, fps, (width, height))
+            if not writer_x.isOpened():
+                raise IOError(f"Could not create video: {out_path_x}")
+            if not writer_y.isOpened():
+                raise IOError(f"Could not create video: {out_path_y}")
+            writers = [(writer_x, out_path_x), (writer_y, out_path_y)]
+        else:
+            out_name = f"{video_path.stem}_segment_{seg_idx:03d}_frames_{read_start}-{read_end}.mp4"
+            out_path = output_dir / out_name
+            writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+            if not writer.isOpened():
+                raise IOError(f"Could not create video: {out_path}")
+            writers = [(writer, out_path)]
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, read_start)
         for local_idx in range(num_frames):
@@ -531,116 +556,129 @@ def render_segment_videos(
             if not ret:
                 break
             global_frame = read_start + local_idx
-            if show_count:
-                text = f"Frame {global_frame}"
-                if padding_frames > 0:
-                    if global_frame < start:
-                        text += f" (pre -{start - global_frame})"
-                    elif global_frame > end:
-                        text += f" (post +{global_frame - end})"
-                cv2.putText(
-                    frame,
-                    text,
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                )
-            # Draw yaw arrow and tag geometry for each tag in this frame when pose_csv is provided
-            for row in pose_by_frame.get(global_frame, []):
-                center_x = float(row["center_x"])
-                center_y = float(row["center_y"])
-                yaw_deg = float(row["yaw_deg"])
-                pitch_deg = row["pitch_deg"] if row.get("pitch_deg", "") != "" else None
-                roll_deg = row["roll_deg"] if row.get("roll_deg", "") != "" else None
-                x_cam = row["x"] if row.get("x", "") != "" else None
-                y_cam = row["y"] if row.get("y", "") != "" else None
-                z_cam = row["z"] if row.get("z", "") != "" else None
-                tracked_flag = row.get("tracked", 0)
-                tag_id = row.get("tag_id", None)
-                try:
-                    tracked_flag = int(tracked_flag)
-                except Exception:
-                    tracked_flag = 0
-                # Pass 3D pose only when all values are present and non-NaN
-                def _f(v):
-                    if v is None or (isinstance(v, float) and np.isnan(v)):
-                        return None
-                    return float(v)
-                # Color arrows differently when the tag location was tracked vs detected.
-                # BGR: detected=red, tracked=yellow.
-                arrow_color = (0, 255, 255) if tracked_flag == 1 else (0, 0, 255)
 
-                # Optionally draw the tag's quadrilateral boundary and per-corner indices
-                if has_corner_columns:
-                    try:
-                        c0 = (int(round(float(row["c0_x"]))), int(round(float(row["c0_y"]))))
-                        c1 = (int(round(float(row["c1_x"]))), int(round(float(row["c1_y"]))))
-                        c2 = (int(round(float(row["c2_x"]))), int(round(float(row["c2_y"]))))
-                        c3 = (int(round(float(row["c3_x"]))), int(round(float(row["c3_y"]))))
-                        corners = [c0, c1, c2, c3]
-                        # Draw boundary lines in the same color as the yaw arrow
-                        for p_start, p_end in zip(corners, corners[1:] + corners[:1]):
-                            cv2.line(
-                                frame,
-                                p_start,
-                                p_end,
-                                arrow_color,
-                                thickness=2,
-                                lineType=cv2.LINE_AA,
-                            )
-                        # Label each corner with its index (0–3) near the corner location
-                        for idx, (cx_i, cy_i) in enumerate(corners):
-                            cv2.putText(
-                                frame,
-                                str(idx),
-                                (cx_i + 3, cy_i - 3),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.4,
-                                arrow_color,
-                                1,
-                                lineType=cv2.LINE_AA,
-                            )
-                    except Exception:
-                        # If any corner values are missing or invalid, skip drawing corners for this tag.
-                        pass
+            if gradient_videos:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                grad_x = gray_to_gradient_for_lk(gray, mode="x")
+                grad_y = gray_to_gradient_for_lk(gray, mode="y")
+                frame_x = cv2.cvtColor(grad_x, cv2.COLOR_GRAY2BGR)
+                frame_y = cv2.cvtColor(grad_y, cv2.COLOR_GRAY2BGR)
+                output_frames = [(frame_x, writer_x), (frame_y, writer_y)]
+            else:
+                output_frames = [(frame, writer)]
 
-                draw_yaw_arrow(
-                    frame,
-                    center_x,
-                    center_y,
-                    yaw_deg,
-                    pitch_deg=_f(pitch_deg),
-                    roll_deg=_f(roll_deg),
-                    x_cam=_f(x_cam),
-                    y_cam=_f(y_cam),
-                    z_cam=_f(z_cam),
-                    camera_intrinsics=camera_intrinsics,
-                    axis_length_m=yaw_arrow_length_m,
-                    arrow_length_px=yaw_arrow_length_px,
-                    color=arrow_color,
-                )
-                # Draw the tag ID label near the tag center, similar to run_on_source.
-                if tag_id is not None:
-                    try:
-                        tag_label = str(int(tag_id))
-                    except Exception:
-                        tag_label = str(tag_id)
+            for out_frame, out_writer in output_frames:
+                if show_count:
+                    text = f"Frame {global_frame}"
+                    if padding_frames > 0:
+                        if global_frame < start:
+                            text += f" (pre -{start - global_frame})"
+                        elif global_frame > end:
+                            text += f" (post +{global_frame - end})"
                     cv2.putText(
-                        frame,
-                        tag_label,
-                        (int(round(center_x)) + 5, int(round(center_y)) - 5),
+                        out_frame,
+                        text,
+                        (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        arrow_color,
-                        1,
-                        lineType=cv2.LINE_AA,
+                        0.7,
+                        (0, 255, 0),
+                        2,
                     )
-            writer.write(frame)
+                # Draw yaw arrow and tag geometry for each tag in this frame when pose_csv is provided
+                for row in pose_by_frame.get(global_frame, []):
+                    center_x = float(row["center_x"])
+                    center_y = float(row["center_y"])
+                    yaw_deg = float(row["yaw_deg"])
+                    pitch_deg = row["pitch_deg"] if row.get("pitch_deg", "") != "" else None
+                    roll_deg = row["roll_deg"] if row.get("roll_deg", "") != "" else None
+                    x_cam = row["x"] if row.get("x", "") != "" else None
+                    y_cam = row["y"] if row.get("y", "") != "" else None
+                    z_cam = row["z"] if row.get("z", "") != "" else None
+                    tracked_flag = row.get("tracked", 0)
+                    tag_id = row.get("tag_id", None)
+                    try:
+                        tracked_flag = int(tracked_flag)
+                    except Exception:
+                        tracked_flag = 0
+                    # Pass 3D pose only when all values are present and non-NaN
+                    def _f(v):
+                        if v is None or (isinstance(v, float) and np.isnan(v)):
+                            return None
+                        return float(v)
+                    # Color arrows differently when the tag location was tracked vs detected.
+                    # BGR: detected=red, tracked=yellow.
+                    arrow_color = (0, 255, 255) if tracked_flag == 1 else (0, 0, 255)
 
-        writer.release()
-        written.append(out_path)
+                    # Optionally draw the tag's quadrilateral boundary and per-corner indices
+                    if has_corner_columns:
+                        try:
+                            c0 = (int(round(float(row["c0_x"]))), int(round(float(row["c0_y"]))))
+                            c1 = (int(round(float(row["c1_x"]))), int(round(float(row["c1_y"]))))
+                            c2 = (int(round(float(row["c2_x"]))), int(round(float(row["c2_y"]))))
+                            c3 = (int(round(float(row["c3_x"]))), int(round(float(row["c3_y"]))))
+                            corners = [c0, c1, c2, c3]
+                            # Draw boundary lines in the same color as the yaw arrow
+                            for p_start, p_end in zip(corners, corners[1:] + corners[:1]):
+                                cv2.line(
+                                    out_frame,
+                                    p_start,
+                                    p_end,
+                                    arrow_color,
+                                    thickness=2,
+                                    lineType=cv2.LINE_AA,
+                                )
+                            # Label each corner with its index (0–3) near the corner location
+                            for idx, (cx_i, cy_i) in enumerate(corners):
+                                cv2.putText(
+                                    out_frame,
+                                    str(idx),
+                                    (cx_i + 3, cy_i - 3),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.4,
+                                    arrow_color,
+                                    1,
+                                    lineType=cv2.LINE_AA,
+                                )
+                        except Exception:
+                            # If any corner values are missing or invalid, skip drawing corners for this tag.
+                            pass
+
+                    draw_yaw_arrow(
+                        out_frame,
+                        center_x,
+                        center_y,
+                        yaw_deg,
+                        pitch_deg=_f(pitch_deg),
+                        roll_deg=_f(roll_deg),
+                        x_cam=_f(x_cam),
+                        y_cam=_f(y_cam),
+                        z_cam=_f(z_cam),
+                        camera_intrinsics=camera_intrinsics,
+                        axis_length_m=yaw_arrow_length_m,
+                        arrow_length_px=yaw_arrow_length_px,
+                        color=arrow_color,
+                    )
+                    # Draw the tag ID label near the tag center, similar to run_on_source.
+                    if tag_id is not None:
+                        try:
+                            tag_label = str(int(tag_id))
+                        except Exception:
+                            tag_label = str(tag_id)
+                        cv2.putText(
+                            out_frame,
+                            tag_label,
+                            (int(round(center_x)) + 5, int(round(center_y)) - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            arrow_color,
+                            1,
+                            lineType=cv2.LINE_AA,
+                        )
+                out_writer.write(out_frame)
+
+        for w, p in writers:
+            w.release()
+            written.append(p)
 
     cap.release()
     return written
@@ -721,6 +759,11 @@ def main() -> None:
         default=None,
         help="Camera intrinsics 'fx,fy,cx,cy' for 3D yaw arrow projection (optional).",
     )
+    parser.add_argument(
+        "--gradient-videos",
+        action="store_true",
+        help="Render gradient videos: two videos per segment (Sobel X and Sobel Y) with frames converted via gray_to_gradient_for_lk before overlays.",
+    )
     args = parser.parse_args()
 
     # If we are running video segmentation and no explicit pose CSV is provided,
@@ -771,6 +814,7 @@ def main() -> None:
             show_count=True,
             pose_csv=args.pose_csv,
             camera_intrinsics=camera_intrinsics,
+            gradient_videos=args.gradient_videos,
         )
         print(f"Wrote {len(paths)} video(s) to {out_dir}")
 
