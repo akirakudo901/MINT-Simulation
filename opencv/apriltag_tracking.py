@@ -373,6 +373,7 @@ def _recover_missing_tags_with_tracking(
     max_tagcoord_rmse: float = 0.25,
     motion_history: Optional[MotionHistory] = None,
     prev_frame_idx: Optional[int] = None,
+    lk_win_size: Tuple[int, int] = (31, 31),
 ) -> FrameDetections:
     """
     Generic helper for both fallback tracking modes.
@@ -414,6 +415,7 @@ def _recover_missing_tags_with_tracking(
             next_frame_gray,
             prev_corners,
             next_pts_initial=next_pts_initial,
+            win_size=lk_win_size,
         )
         if int(np.sum(st)) < 3:
             continue
@@ -503,6 +505,7 @@ def track_pose_detections_with_fallback(
     max_tagcoord_rmse: float = 0.25,
     motion_history: Optional[MotionHistory] = None,
     prev_frame_idx: Optional[int] = None,
+    lk_win_size: Tuple[int, int] = (31, 31),
 ) -> FrameDetections:
     """
     Given previous-frame detections and raw detections for the next frame (both
@@ -526,4 +529,5 @@ def track_pose_detections_with_fallback(
         max_tagcoord_rmse=max_tagcoord_rmse,
         motion_history=motion_history,
         prev_frame_idx=prev_frame_idx,
+        lk_win_size=lk_win_size,
     )

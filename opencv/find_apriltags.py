@@ -357,6 +357,7 @@ def _process_frame_and_collect(
     camera_intrinsics: Optional[tuple[float, float, float, float]] = None,
     tag_size_m: Optional[float] = None,
     use_fallback_tracking: bool = False,
+    lk_win_size: tuple[int, int] = (31, 31),
     prev_gray: Optional[np.ndarray] = None,
     prev_frame_dets: Optional[FrameDetections] = None,
     csv_rows: Optional[list[dict]] = None,
@@ -396,6 +397,7 @@ def _process_frame_and_collect(
                 tag_size=float(tag_size_m) if tag_size_m is not None else 1.0,
                 motion_history=motion_history,
                 prev_frame_idx=frame_idx - 1,
+                lk_win_size=lk_win_size,
             )
             existing_ids = {int(d.tag_id) for d in detections}
             for tag_id, ts in frame_dets.tags.items():
@@ -497,6 +499,7 @@ def run_on_source(
     tag_size_m: Optional[float] = None,
     output_csv: Optional[str | Path] = None,
     use_fallback_tracking: bool = False,
+    lk_win_size: tuple[int, int] = (31, 31),
 ) -> None:
     """
     Run AprilTag detection on a video file or live camera.
@@ -605,6 +608,7 @@ def run_on_source(
         camera_intrinsics,
         tag_size_m,
         use_fallback_tracking,
+        lk_win_size,
         show,
         window_name,
         output_csv,
@@ -646,6 +650,7 @@ def run_on_source(
                 camera_intrinsics=camera_intrinsics,
                 tag_size_m=tag_size_m,
                 use_fallback_tracking=use_fallback_tracking,
+                lk_win_size=lk_win_size,
                 prev_gray=prev_gray,
                 prev_frame_dets=prev_frame_dets,
                 csv_rows=csv_rows if (use_pose and output_csv) else None,
@@ -715,6 +720,7 @@ def run_on_source(
             camera_intrinsics,
             tag_size_m,
             use_fallback_tracking,
+            lk_win_size,
             show,
             window_name,
             output_csv,
@@ -752,6 +758,7 @@ def run_on_source(
             camera_intrinsics,
             tag_size_m,
             use_fallback_tracking,
+            lk_win_size,
             show,
             window_name,
             output_csv,
@@ -1010,6 +1017,13 @@ def main():
         help="When pose estimation is OFF, recover missing tags using per-tag optical-flow tracking between frames.",
     )
     parser.add_argument(
+        "--lk-winsize",
+        type=int,
+        default=31,
+        metavar="N",
+        help="LK optical flow window size in pixels (default 31). Used for fallback tracking; window is N×N.",
+    )
+    parser.add_argument(
         "--segments",
         type=str,
         default=None,
@@ -1086,6 +1100,7 @@ def main():
             )
             sys.exit(1)
 
+    lk_win_size = (args.lk_winsize, args.lk_winsize)
     if args.camera is not None:
         run_on_source(
             args.camera,
@@ -1097,6 +1112,7 @@ def main():
             tag_size_m=args.tag_size,
             output_csv=args.output_csv,
             use_fallback_tracking=args.fallback_tracking,
+            lk_win_size=lk_win_size,
             segments=segments,
         )
     else:
@@ -1108,6 +1124,7 @@ def main():
             tag_size_m=args.tag_size,
             output_csv=args.output_csv,
             use_fallback_tracking=args.fallback_tracking,
+            lk_win_size=lk_win_size,
             segments=segments,
         )
 
