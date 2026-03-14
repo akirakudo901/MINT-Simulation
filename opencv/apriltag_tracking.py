@@ -311,6 +311,61 @@ def detect_to_frame_detections(
     return FrameDetections(frame_idx=frame_idx, tags=tags)
 
 
+def gray_to_gradient_for_lk(
+    gray: np.ndarray,
+    *,
+    mode: str = "xy",
+    ksize: int = 3,
+    blur_sigma: float = 0.0,
+) -> np.ndarray:
+    """
+    Preprocess grayscale image for LK tracking so that edges (white on one side,
+    black on the other) are matched to points with the same gradient property.
+
+    LK minimizes intensity difference in a window. By passing gradient images
+    instead of raw intensity, "brightness constancy" becomes gradient constancy:
+    a point is matched where the gradient (direction and sense) is the same.
+
+    Parameters
+    ----------
+    gray : np.ndarray
+        Grayscale image (uint8 or float).
+    mode : str
+        - "xy": 2-channel image (I_x, I_y). Matches full gradient vector;
+          any edge direction is matched by same orientation and sense.
+        - "x": 1-channel I_x. Strong for horizontal edges (white-left/black-right
+          vs black-left/white-right).
+        - "y": 1-channel I_y. Strong for vertical edges.
+    ksize : int
+        Sobel kernel size (1, 3, 5, or 7).
+    blur_sigma : float
+        If > 0, apply Gaussian blur before Sobel to reduce noise (e.g. 0.5–1.0).
+
+    Returns
+    -------
+    np.ndarray
+        uint8 image, 1 or 2 channels. Gradient values are mapped to [0, 255]
+        with zero gradient at 128 so same gradient → same value.
+    """
+    if gray.dtype != np.uint8:
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    if blur_sigma > 0:
+        gray = cv2.GaussianBlur(gray, (0, 0), blur_sigma)
+    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=ksize)
+    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=ksize)
+    # Map gradient to [0, 255] with zero at 128 (Sobel on uint8 is in ~[-1020, 1020])
+    scale = 127.0 / max(1e-6, (255.0 * 4))  # 4 from typical 3x3 Sobel scale
+    def to_uint8(g: np.ndarray) -> np.ndarray:
+        return np.clip(128 + g * scale, 0, 255).astype(np.uint8)
+    if mode == "x":
+        return to_uint8(sobel_x)
+    if mode == "y":
+        return to_uint8(sobel_y)
+    if mode == "xy":
+        return np.stack([to_uint8(sobel_x), to_uint8(sobel_y)], axis=-1)
+    raise ValueError("mode must be 'x', 'y', or 'xy'")
+
+
 def _lk_track_points(
     prev_gray: np.ndarray,
     next_gray: np.ndarray,
@@ -374,6 +429,7 @@ def _recover_missing_tags_with_tracking(
     motion_history: Optional[MotionHistory] = None,
     prev_frame_idx: Optional[int] = None,
     lk_win_size: Tuple[int, int] = (31, 31),
+    lk_gradient_preprocess: bool = False,
 ) -> FrameDetections:
     """
     Generic helper for both fallback tracking modes.
@@ -388,6 +444,13 @@ def _recover_missing_tags_with_tracking(
     missing = sorted(prev_ids - next_ids)
     if not missing:
         return raw_next
+
+    if lk_gradient_preprocess:
+        prev_lk = gray_to_gradient_for_lk(prev_frame_gray, mode="xy")
+        next_lk = gray_to_gradient_for_lk(next_frame_gray, mode="xy")
+    else:
+        prev_lk = prev_frame_gray
+        next_lk = next_frame_gray
 
     final_tags = dict(raw_next.tags)
     next_frame_idx = frame_idx
@@ -411,8 +474,8 @@ def _recover_missing_tags_with_tracking(
             )
 
         tracked, st, err = _lk_track_points(
-            prev_frame_gray,
-            next_frame_gray,
+            prev_lk,
+            next_lk,
             prev_corners,
             next_pts_initial=next_pts_initial,
             win_size=lk_win_size,
@@ -506,6 +569,7 @@ def track_pose_detections_with_fallback(
     motion_history: Optional[MotionHistory] = None,
     prev_frame_idx: Optional[int] = None,
     lk_win_size: Tuple[int, int] = (31, 31),
+    lk_gradient_preprocess: bool = False,
 ) -> FrameDetections:
     """
     Given previous-frame detections and raw detections for the next frame (both
@@ -530,4 +594,5 @@ def track_pose_detections_with_fallback(
         motion_history=motion_history,
         prev_frame_idx=prev_frame_idx,
         lk_win_size=lk_win_size,
+        lk_gradient_preprocess=lk_gradient_preprocess,
     )

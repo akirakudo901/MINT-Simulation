@@ -358,6 +358,7 @@ def _process_frame_and_collect(
     tag_size_m: Optional[float] = None,
     use_fallback_tracking: bool = False,
     lk_win_size: tuple[int, int] = (31, 31),
+    lk_gradient_preprocess: bool = False,
     prev_gray: Optional[np.ndarray] = None,
     prev_frame_dets: Optional[FrameDetections] = None,
     csv_rows: Optional[list[dict]] = None,
@@ -398,6 +399,7 @@ def _process_frame_and_collect(
                 motion_history=motion_history,
                 prev_frame_idx=frame_idx - 1,
                 lk_win_size=lk_win_size,
+                lk_gradient_preprocess=lk_gradient_preprocess,
             )
             existing_ids = {int(d.tag_id) for d in detections}
             for tag_id, ts in frame_dets.tags.items():
@@ -500,6 +502,7 @@ def run_on_source(
     output_csv: Optional[str | Path] = None,
     use_fallback_tracking: bool = False,
     lk_win_size: tuple[int, int] = (31, 31),
+    lk_gradient_preprocess: bool = False,
 ) -> None:
     """
     Run AprilTag detection on a video file or live camera.
@@ -609,6 +612,7 @@ def run_on_source(
         tag_size_m,
         use_fallback_tracking,
         lk_win_size,
+        lk_gradient_preprocess,
         show,
         window_name,
         output_csv,
@@ -651,6 +655,7 @@ def run_on_source(
                 tag_size_m=tag_size_m,
                 use_fallback_tracking=use_fallback_tracking,
                 lk_win_size=lk_win_size,
+                lk_gradient_preprocess=lk_gradient_preprocess,
                 prev_gray=prev_gray,
                 prev_frame_dets=prev_frame_dets,
                 csv_rows=csv_rows if (use_pose and output_csv) else None,
@@ -721,6 +726,7 @@ def run_on_source(
             tag_size_m,
             use_fallback_tracking,
             lk_win_size,
+            lk_gradient_preprocess,
             show,
             window_name,
             output_csv,
@@ -759,6 +765,7 @@ def run_on_source(
             tag_size_m,
             use_fallback_tracking,
             lk_win_size,
+            lk_gradient_preprocess,
             show,
             window_name,
             output_csv,
@@ -1024,6 +1031,11 @@ def main():
         help="LK optical flow window size in pixels (default 31). Used for fallback tracking; window is N×N.",
     )
     parser.add_argument(
+        "--lk-gradient-preprocess",
+        action="store_true",
+        help="Preprocess grayscale with gradient (I_x, I_y) before LK so edges match by same gradient direction/sense.",
+    )
+    parser.add_argument(
         "--segments",
         type=str,
         default=None,
@@ -1113,6 +1125,7 @@ def main():
             output_csv=args.output_csv,
             use_fallback_tracking=args.fallback_tracking,
             lk_win_size=lk_win_size,
+            lk_gradient_preprocess=args.lk_gradient_preprocess,
             segments=segments,
         )
     else:
@@ -1125,6 +1138,7 @@ def main():
             output_csv=args.output_csv,
             use_fallback_tracking=args.fallback_tracking,
             lk_win_size=lk_win_size,
+            lk_gradient_preprocess=args.lk_gradient_preprocess,
             segments=segments,
         )
 
