@@ -375,6 +375,21 @@ def _lk_track_points(
     win_size: Tuple[int, int] = (31, 31),
     max_level: int = 4,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Track points from prev_gray to next_gray using Lucas-Kanade optical flow.
+
+    Image shape requirement
+    -----------------------
+    prev_gray and next_gray must be single-channel 2D arrays of shape (height, width).
+    OpenCV's cv2.calcOpticalFlowPyrLK() expects grayscale (1-channel) images; it does
+    not support 2-channel or 3-channel inputs. The algorithm minimizes intensity
+    difference in a window, so the input is interpreted as scalar intensity.
+    """
+    if prev_gray.ndim != 2 or next_gray.ndim != 2:
+        raise ValueError(
+            "prev_gray and next_gray must be 2D (single-channel); "
+            f"got prev_gray.ndim={prev_gray.ndim}, next_gray.ndim={next_gray.ndim}"
+        )
     p0 = np.asarray(pts_prev, dtype=np.float32).reshape(-1, 1, 2)
     if next_pts_initial is not None:
         p1_init = np.asarray(next_pts_initial, dtype=np.float32).reshape(-1, 1, 2)
@@ -448,9 +463,11 @@ def _recover_missing_tags_with_tracking(
     if lk_gradient_preprocess:
         prev_lk = gray_to_gradient_for_lk(prev_frame_gray, mode="xy")
         next_lk = gray_to_gradient_for_lk(next_frame_gray, mode="xy")
+        lk_use_two_channels = prev_lk.ndim == 3 and prev_lk.shape[-1] == 2
     else:
         prev_lk = prev_frame_gray
         next_lk = next_frame_gray
+        lk_use_two_channels = False
 
     final_tags = dict(raw_next.tags)
     next_frame_idx = frame_idx
@@ -473,13 +490,33 @@ def _recover_missing_tags_with_tracking(
                 tag_id, prev_corners, prev_center, prev_frame_idx, next_frame_idx
             )
 
-        tracked, st, err = _lk_track_points(
-            prev_lk,
-            next_lk,
-            prev_corners,
-            next_pts_initial=next_pts_initial,
-            win_size=lk_win_size,
-        )
+        if lk_use_two_channels:
+            # LK requires single-channel (H, W); run on I_x and I_y and average flows
+            tracked_x, st_x, err_x = _lk_track_points(
+                prev_lk[:, :, 0],
+                next_lk[:, :, 0],
+                prev_corners,
+                next_pts_initial=next_pts_initial,
+                win_size=lk_win_size,
+            )
+            tracked_y, st_y, err_y = _lk_track_points(
+                prev_lk[:, :, 1],
+                next_lk[:, :, 1],
+                prev_corners,
+                next_pts_initial=next_pts_initial,
+                win_size=lk_win_size,
+            )
+            st = np.minimum(st_x, st_y)
+            err = np.maximum(err_x, err_y)
+            tracked = (tracked_x + tracked_y) * 0.5
+        else:
+            tracked, st, err = _lk_track_points(
+                prev_lk,
+                next_lk,
+                prev_corners,
+                next_pts_initial=next_pts_initial,
+                win_size=lk_win_size,
+            )
         if int(np.sum(st)) < 3:
             continue
         if float(np.max(err[st.astype(bool)])) > max_corner_err_px:
